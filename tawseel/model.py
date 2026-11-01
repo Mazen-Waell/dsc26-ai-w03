@@ -1,66 +1,139 @@
-"""Failure-risk baseline for Tawseel COD parcels.
-
-You write this file. Keep every name and signature exactly as it is: the grader imports them.
-Allowed dependencies: numpy, pandas, scikit-learn (and the standard library).
-"""
 from __future__ import annotations
 
+import math
+
+import numpy as np
 import pandas as pd
+from sklearn.compose import ColumnTransformer
+from sklearn.dummy import DummyClassifier
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.impute import SimpleImputer
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import average_precision_score, brier_score_loss, roc_auc_score
 from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import FunctionTransformer, OneHotEncoder, StandardScaler
 
 TARGET = "failed"
 
-# The raw columns of make_parcels() that the model may use at decision time (when the parcel
-# is created). Nothing known only after the delivery attempt, not the label, not the row id.
-# TODO: this is every column of the table. Keep only the ones known at decision time.
 FEATURE_COLUMNS: list[str] = [
-    "parcel_id", "customer_id", "merchant_id", "area", "created_at", "promised_slot",
-    "cod_amount", "n_items", "address_text", "courier_notes", "delivered_at", "failed",
+    "customer_id", "merchant_id", "area", "created_at", "promised_slot",
+    "cod_amount", "n_items", "address_text",
 ]
+
+HISTORY_COLUMNS = ["customer_prior_parcels", "customer_prior_fail_rate"]
+CATEGORICAL = ["area", "merchant_id", "promised_slot"]
+NUMERIC = ["n_items", "customer_prior_parcels", "customer_prior_fail_rate"]
 
 
 def add_history_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Return a copy of df (same index and row order) with two new columns.
+    work = pd.DataFrame({
+        "cust": df["customer_id"].to_numpy(),
+        "t": df["created_at"].to_numpy(),
+        "f": df["failed"].to_numpy(),
+    })
+    groups = (work.groupby(["cust", "t"], sort=True, dropna=False)
+              .agg(n=("f", "size"), s=("f", "sum"))
+              .reset_index())
+    by_cust = groups.groupby("cust", sort=False, dropna=False)
+    groups["prior_n"] = by_cust["n"].cumsum() - groups["n"]
+    groups["prior_s"] = by_cust["s"].cumsum() - groups["s"]
 
-    Needs customer_id, created_at and failed.
-    - customer_prior_parcels (int): the same customer's parcels with created_at strictly
-      earlier than this row.
-    - customer_prior_fail_rate (float): share of those that failed; NaN when there are none.
-    Parcels with the same timestamp are not prior to each other. The result must not depend
-    on the input row order. Never modify the input.
-    """
-    raise NotImplementedError
+    merged = work.merge(groups[["cust", "t", "prior_n", "prior_s"]],
+                        on=["cust", "t"], how="left")
+    prior_n = merged["prior_n"].to_numpy()
+    prior_s = merged["prior_s"].to_numpy(dtype=float)
+    rate = np.where(prior_n > 0, prior_s / np.maximum(prior_n, 1), np.nan)
+
+    out = df.copy()
+    out["customer_prior_parcels"] = prior_n.astype(int)
+    out["customer_prior_fail_rate"] = rate
+    return out
 
 
 def time_split(df: pd.DataFrame, time_col: str = "created_at",
                test_fraction: float = 0.2) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Return (train, test).
+    if not 0 < test_fraction < 1:
+        raise ValueError("test_fraction must be strictly between 0 and 1")
+    ordered = df.sort_values(time_col, kind="stable")
+    n_test = math.ceil(len(df) * test_fraction)
+    boundary = ordered[time_col].iloc[len(df) - n_test]
+    test = df[df[time_col] >= boundary]
+    train = df[df[time_col] < boundary]
+    return train, test
 
-    ValueError unless 0 < test_fraction < 1. Sort by time; n_test = ceil(len(df) * test_fraction);
-    the boundary is the timestamp of the first of the last n_test rows. Rows at or after the
-    boundary are test, rows before it are train.
-    """
-    raise NotImplementedError
+
+def _as_object(X):
+    return X.astype(object).where(X.notna(), np.nan)
+
+
+def _log1p(X):
+    return np.log1p(np.clip(X, 0, None))
+
+
+def _fill_text(X):
+    return pd.Series(X).fillna("").astype(str)
+
+
+def _empty_flag(X):
+    col = X.iloc[:, 0].fillna("").astype(str).str.strip()
+    return (col == "").to_numpy(dtype=float).reshape(-1, 1)
 
 
 def build_pipeline(seed: int = 0) -> Pipeline:
-    """Return an UNFITTED Pipeline.
+    categorical = Pipeline([
+        ("to_object", FunctionTransformer(_as_object)),
+        ("impute", SimpleImputer(strategy="constant", fill_value="missing")),
+        ("onehot", OneHotEncoder(handle_unknown="ignore")),
+    ])
+    numeric = Pipeline([
+        ("impute", SimpleImputer(strategy="median", add_indicator=True,
+                                 keep_empty_features=True)),
+        ("scale", StandardScaler()),
+    ])
+    cod = Pipeline([
+        ("impute", SimpleImputer(strategy="median", add_indicator=True,
+                                 keep_empty_features=True)),
+        ("log", FunctionTransformer(_log1p)),
+        ("scale", StandardScaler()),
+    ])
+    address = Pipeline([
+        ("fill", FunctionTransformer(_fill_text)),
+        ("tfidf", TfidfVectorizer(ngram_range=(1, 2), min_df=5, sublinear_tf=True)),
+    ])
 
-    Input: a DataFrame with at least FEATURE_COLUMNS plus the two history columns; ignore any
-    other column. The final step must support predict_proba. Must not fail on unseen
-    categories, missing numbers, missing categories or empty address strings. Same seed and
-    same data must give identical predictions.
-    """
-    raise NotImplementedError
+    prep = ColumnTransformer([
+        ("cat", categorical, CATEGORICAL),
+        ("num", numeric, NUMERIC),
+        ("cod", cod, ["cod_amount"]),
+        ("addr", address, "address_text"),
+        ("addr_empty", FunctionTransformer(_empty_flag), ["address_text"]),
+    ], remainder="drop")
+
+    return Pipeline([
+        ("prep", prep),
+        ("clf", LogisticRegression(C=1.0, max_iter=2000, random_state=seed)),
+    ])
 
 
 def evaluate(model, test_df: pd.DataFrame) -> dict:
-    """{"roc_auc", "pr_auc", "brier", "base_rate", "n"} from model.predict_proba(test_df)[:, 1]
-    against test_df["failed"] (roc_auc_score, average_precision_score, brier_score_loss)."""
-    raise NotImplementedError
+    y = test_df[TARGET]
+    proba = model.predict_proba(test_df)[:, 1]
+    return {
+        "roc_auc": float(roc_auc_score(y, proba)),
+        "pr_auc": float(average_precision_score(y, proba)),
+        "brier": float(brier_score_loss(y, proba)),
+        "base_rate": float(y.mean()),
+        "n": int(len(test_df)),
+    }
 
 
 def compare_to_baseline(train_df: pd.DataFrame, test_df: pd.DataFrame, seed: int = 0) -> dict:
-    """Fit build_pipeline(seed) and DummyClassifier(strategy="prior") on train_df only, evaluate
-    both on test_df, return {"model": {...}, "dummy": {...}, "lift_pr_auc": model - dummy PR-AUC}."""
-    raise NotImplementedError
+    model = build_pipeline(seed).fit(train_df, train_df[TARGET])
+    dummy = DummyClassifier(strategy="prior").fit(train_df, train_df[TARGET])
+    model_scores = evaluate(model, test_df)
+    dummy_scores = evaluate(dummy, test_df)
+    return {
+        "model": model_scores,
+        "dummy": dummy_scores,
+        "lift_pr_auc": model_scores["pr_auc"] - dummy_scores["pr_auc"],
+    }
